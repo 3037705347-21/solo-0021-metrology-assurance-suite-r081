@@ -48,8 +48,10 @@ type DeviceResponse struct {
 }
 
 type ChecksResponse struct {
-	CurrentCheckID string                     `json:"current_check_id,omitempty"`
-	Checks         []domain.IntermediateCheck `json:"checks"`
+	CurrentCheckID    string                     `json:"current_check_id,omitempty"`
+	CurrentCheckValid bool                       `json:"current_check_valid"`
+	CurrentCheckUntil time.Time                  `json:"current_check_until,omitempty"`
+	Checks            []domain.IntermediateCheck `json:"checks"`
 }
 
 type CaseResponse struct {

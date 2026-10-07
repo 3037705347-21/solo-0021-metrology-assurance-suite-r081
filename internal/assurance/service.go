@@ -150,8 +150,15 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if !exists {
 			return fmt.Errorf("%w: device %s", domain.ErrNotFound, item.DeviceID)
 		}
-		if device.CurrentCheckID != "" && !device.HasCurrentCheck() {
-			return fmt.Errorf("%w: device %s has no valid intermediate check", domain.ErrStateConflict, device.ID)
+		now := s.now()
+		if !device.HasValidCheck(now) {
+			return fmt.Errorf("%w: device %s has no passed, unexpired intermediate check", domain.ErrNoValidCheck, device.ID)
+		}
+		// The current check is pinned onto the measurement at record time and is
+		// never rewritten by checks registered later.
+		check, exists := m.Check(device.CurrentCheckID)
+		if !exists || check.DeviceID != device.ID || !check.IsInForce(now) {
+			return fmt.Errorf("%w: device %s current check %s is not in force", domain.ErrNoValidCheck, device.ID, device.CurrentCheckID)
 		}
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
@@ -160,13 +167,13 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			item.Nominal,
 			item.Tolerance,
 			input.Technician,
-			device.CurrentCheckID,
-			s.now(),
+			check.ID,
+			now,
 		)
 		if err != nil {
 			return err
 		}
-		if err := item.RecordMeasurement(measurement.Accepted, s.now()); err != nil {
+		if err := item.RecordMeasurement(measurement.Accepted, now); err != nil {
 			return err
 		}
 		if err := m.AppendMeasurement(measurement); err != nil {
@@ -241,16 +248,16 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 }
 
 func (s *Service) RecordCheck(ctx context.Context, deviceID string, input contracts.RecordCheckRequest) (contracts.ChecksResponse, error) {
-	var (
-		result  contracts.ChecksResponse
-		created domain.IntermediateCheck
-	)
+	var result contracts.ChecksResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		id := strings.TrimSpace(deviceID)
 		device, exists := m.Device(id)
 		if !exists {
 			return fmt.Errorf("%w: device %s", domain.ErrNotFound, id)
 		}
+		// Validate the check before anything is written. An invalid registration
+		// must fail inside this callback, so the commit rolls back and leaves no
+		// check, device pointer, or event behind.
 		item, err := domain.NewIntermediateCheck(
 			m.NextID("check"),
 			device.ID,
@@ -266,33 +273,50 @@ func (s *Service) RecordCheck(ctx context.Context, deviceID string, input contra
 		if err := m.AppendCheck(item); err != nil {
 			return err
 		}
-		device.AdoptCheck(item.ID, item.Result, item.ValidUntil)
+		// Only a check that is in force at registration time can be adopted as the
+		// device's current check. A failed check clears the current check, so a
+		// failed or expired device can never look valid; a stale, already-expired
+		// pass is recorded for history but never demotes a still-valid check.
+		adopted := false
+		switch {
+		case item.Result == domain.CheckFailed:
+			device.ApplyCheck(item)
+		case item.IsInForce(s.now()):
+			device.ApplyCheck(item)
+			adopted = true
+		}
 		if err := m.UpdateDevice(device); err != nil {
 			return err
+		}
+		kind := "device_check_recorded"
+		detail := "intermediate check recorded without becoming the current check"
+		switch {
+		case item.Result == domain.CheckFailed:
+			kind = "device_check_failed"
+			detail = "intermediate check failed and the device has no current check"
+		case adopted:
+			kind = "device_check_passed"
+			detail = "intermediate check passed and adopted as the current check"
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
 			"device",
 			device.ID,
 			"",
-			"device_check_recorded",
+			kind,
 			item.PerformedBy,
-			"intermediate check recorded for device",
+			detail,
 			s.now(),
 		)
 		if err != nil {
 			return err
 		}
 		m.AppendEvent(event)
-		created = item
-		result = checksResponse(m, device)
+		result = checksResponseAt(m, device, s.now())
 		return nil
 	})
 	if err != nil {
 		return contracts.ChecksResponse{}, err
-	}
-	if !created.ValidUntil.After(created.PerformedAt) {
-		return contracts.ChecksResponse{}, fmt.Errorf("%w: check validity window is invalid", domain.ErrInvalidInput)
 	}
 	return result, nil
 }
@@ -305,7 +329,7 @@ func (s *Service) Checks(ctx context.Context, deviceID string) (contracts.Checks
 		if !exists {
 			return fmt.Errorf("%w: device %s", domain.ErrNotFound, id)
 		}
-		result = checksResponseFromSnapshot(snapshot, device)
+		result = checksResponseFromSnapshotAt(snapshot, device, s.now())
 		return nil
 	})
 	return result, err
@@ -326,6 +350,10 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if !ok {
 			return fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
 		}
+		pinnedCheck, exists := m.Check(measurement.CheckID)
+		if !exists || pinnedCheck.DeviceID != item.DeviceID {
+			return fmt.Errorf("%w: accepted measurement %s does not reference a recorded check of device %s", domain.ErrStateConflict, measurement.ID, item.DeviceID)
+		}
 		if err := item.Seal(s.now()); err != nil {
 			return err
 		}
@@ -334,6 +362,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			item.ID,
 			item.DeviceID,
 			measurement.ID,
+			measurement.CheckID,
 			input.Reviewer,
 			input.Summary,
 			s.now(),
@@ -391,9 +420,6 @@ func caseResponse(m *repository.Mutation, item domain.VerificationCase) contract
 	if seal, exists := m.Seal(item.ID); exists {
 		result.Seal = &seal
 	}
-	if device, exists := m.Device(item.DeviceID); exists {
-		result.Measurements = bindMeasurementsToCurrentCheck(result.Measurements, device.CurrentCheckID)
-	}
 	return result
 }
 
@@ -406,29 +432,23 @@ func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.Verifica
 	if seal, exists := snapshot.Seal(item.ID); exists {
 		result.Seal = &seal
 	}
-	if device, exists := snapshot.Device(item.DeviceID); exists {
-		result.Measurements = bindMeasurementsToCurrentCheck(result.Measurements, device.CurrentCheckID)
-	}
 	return result
 }
 
-func bindMeasurementsToCurrentCheck(items []domain.Measurement, checkID string) []domain.Measurement {
-	for index := range items {
-		items[index].CheckID = checkID
-	}
-	return items
-}
-
-func checksResponse(m *repository.Mutation, device domain.Device) contracts.ChecksResponse {
+func checksResponseAt(m *repository.Mutation, device domain.Device, now time.Time) contracts.ChecksResponse {
 	return contracts.ChecksResponse{
-		CurrentCheckID: device.CurrentCheckID,
-		Checks:         m.Checks(device.ID),
+		CurrentCheckID:    device.CurrentCheckID,
+		CurrentCheckValid: device.HasValidCheck(now),
+		CurrentCheckUntil: device.CurrentCheckUntil,
+		Checks:            m.Checks(device.ID),
 	}
 }
 
-func checksResponseFromSnapshot(snapshot repository.Snapshot, device domain.Device) contracts.ChecksResponse {
+func checksResponseFromSnapshotAt(snapshot repository.Snapshot, device domain.Device, now time.Time) contracts.ChecksResponse {
 	return contracts.ChecksResponse{
-		CurrentCheckID: device.CurrentCheckID,
-		Checks:         snapshot.Checks(device.ID),
+		CurrentCheckID:    device.CurrentCheckID,
+		CurrentCheckValid: device.HasValidCheck(now),
+		CurrentCheckUntil: device.CurrentCheckUntil,
+		Checks:            snapshot.Checks(device.ID),
 	}
 }

@@ -72,7 +72,19 @@ func (c IntermediateCheck) Validate() error {
 	if c.PerformedAt.IsZero() || c.ValidUntil.IsZero() {
 		return fmt.Errorf("%w: check performance and validity times are required", ErrInvalidInput)
 	}
+	if !c.ValidUntil.After(c.PerformedAt) {
+		return fmt.Errorf("%w: check validity deadline must be after the performance time", ErrInvalidInput)
+	}
 	return nil
+}
+
+// IsInForce reports whether the check passed and is inside its validity window
+// at now: the check has already been performed and has not expired.
+func (c IntermediateCheck) IsInForce(now time.Time) bool {
+	stamp := now.UTC()
+	return c.Result == CheckPassed &&
+		!c.PerformedAt.After(stamp) &&
+		c.ValidUntil.After(stamp)
 }
 
 func NewDevice(id, assetTag, model, room, steward string, at time.Time) (Device, error) {
@@ -127,12 +139,26 @@ func (d *Device) Retire(at time.Time) error {
 	return nil
 }
 
-func (d *Device) AdoptCheck(id string, result CheckResult, validUntil time.Time) {
-	d.CurrentCheckID = strings.TrimSpace(id)
+// ApplyCheck adopts a check as the device's current check. A failed check can
+// never be the check in force: it clears any previously adopted check so that
+// one device has at most one check that could currently be valid.
+func (d *Device) ApplyCheck(check IntermediateCheck) {
+	if check.Result != CheckPassed {
+		d.CurrentCheckID = ""
+		d.CurrentCheckResult = ""
+		d.CurrentCheckUntil = time.Time{}
+		return
+	}
+	d.CurrentCheckID = check.ID
 	d.CurrentCheckResult = CheckPassed
-	d.CurrentCheckUntil = validUntil.UTC()
+	d.CurrentCheckUntil = check.ValidUntil.UTC()
 }
 
-func (d Device) HasCurrentCheck() bool {
-	return d.CurrentCheckID != "" && d.CurrentCheckResult == CheckPassed
+// HasValidCheck reports whether the device has a passed check whose validity
+// window has not expired at now.
+func (d Device) HasValidCheck(now time.Time) bool {
+	return d.CurrentCheckID != "" &&
+		d.CurrentCheckResult == CheckPassed &&
+		!d.CurrentCheckUntil.IsZero() &&
+		d.CurrentCheckUntil.After(now.UTC())
 }

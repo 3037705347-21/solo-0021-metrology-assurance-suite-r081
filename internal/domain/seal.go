@@ -7,24 +7,26 @@ import (
 )
 
 type EvidenceSeal struct {
-	ID            string    `json:"id"`
-	CaseID        string    `json:"case_id"`
-	DeviceID      string    `json:"device_id"`
-	MeasurementID string    `json:"measurement_id"`
-	Reviewer      string    `json:"reviewer"`
-	Summary       string    `json:"summary"`
-	SealedAt      time.Time `json:"sealed_at"`
+	ID                 string    `json:"id"`
+	CaseID             string    `json:"case_id"`
+	DeviceID           string    `json:"device_id"`
+	MeasurementID      string    `json:"measurement_id"`
+	MeasurementCheckID string    `json:"measurement_check_id"`
+	Reviewer           string    `json:"reviewer"`
+	Summary            string    `json:"summary"`
+	SealedAt           time.Time `json:"sealed_at"`
 }
 
-func NewEvidenceSeal(id, caseID, deviceID, measurementID, reviewer, summary string, at time.Time) (EvidenceSeal, error) {
+func NewEvidenceSeal(id, caseID, deviceID, measurementID, measurementCheckID, reviewer, summary string, at time.Time) (EvidenceSeal, error) {
 	item := EvidenceSeal{
-		ID:            strings.TrimSpace(id),
-		CaseID:        strings.TrimSpace(caseID),
-		DeviceID:      strings.TrimSpace(deviceID),
-		MeasurementID: strings.TrimSpace(measurementID),
-		Reviewer:      strings.TrimSpace(reviewer),
-		Summary:       strings.TrimSpace(summary),
-		SealedAt:      at.UTC(),
+		ID:                 strings.TrimSpace(id),
+		CaseID:             strings.TrimSpace(caseID),
+		DeviceID:           strings.TrimSpace(deviceID),
+		MeasurementID:      strings.TrimSpace(measurementID),
+		MeasurementCheckID: strings.TrimSpace(measurementCheckID),
+		Reviewer:           strings.TrimSpace(reviewer),
+		Summary:            strings.TrimSpace(summary),
+		SealedAt:           at.UTC(),
 	}
 	if err := item.Validate(); err != nil {
 		return EvidenceSeal{}, err
@@ -33,8 +35,8 @@ func NewEvidenceSeal(id, caseID, deviceID, measurementID, reviewer, summary stri
 }
 
 func (s EvidenceSeal) Validate() error {
-	if s.ID == "" || s.CaseID == "" || s.DeviceID == "" || s.MeasurementID == "" || s.Reviewer == "" || s.Summary == "" {
-		return fmt.Errorf("%w: seal id, case, device, measurement, reviewer, and summary are required", ErrInvalidInput)
+	if s.ID == "" || s.CaseID == "" || s.DeviceID == "" || s.MeasurementID == "" || s.MeasurementCheckID == "" || s.Reviewer == "" || s.Summary == "" {
+		return fmt.Errorf("%w: seal id, case, device, measurement, check, reviewer, and summary are required", ErrInvalidInput)
 	}
 	if s.SealedAt.IsZero() {
 		return fmt.Errorf("%w: seal time is required", ErrInvalidInput)

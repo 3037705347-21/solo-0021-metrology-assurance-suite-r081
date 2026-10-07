@@ -35,11 +35,14 @@ func main() {
 	flag.Parse()
 
 	checks := map[string]func() error{
-		"register-device":          checkRegisterDevice,
-		"open-verification-case":   checkOpenVerificationCase,
-		"record-measurement":       checkRecordMeasurement,
-		"reopen-verification-case": checkReopenVerificationCase,
-		"seal-verification":        checkSealVerification,
+		"register-device":           checkRegisterDevice,
+		"open-verification-case":    checkOpenVerificationCase,
+		"record-measurement":        checkRecordMeasurement,
+		"reopen-verification-case":  checkReopenVerificationCase,
+		"seal-verification":         checkSealVerification,
+		"record-intermediate-check": checkRecordIntermediateCheck,
+		"measurement-check-gate":    checkMeasurementCheckGate,
+		"measurement-check-pinning": checkMeasurementCheckPinning,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -167,6 +170,9 @@ func checkRecordMeasurement() error {
 	if err != nil {
 		return err
 	}
+	if err := h.recordPassingCheck(deviceID); err != nil {
+		return err
+	}
 	opened, err := h.openCase(deviceID)
 	if err != nil {
 		return err
@@ -210,6 +216,9 @@ func checkRecordMeasurement() error {
 
 	rejectDeviceID, err := h.createDevice("MET-1202")
 	if err != nil {
+		return err
+	}
+	if err := h.recordPassingCheck(rejectDeviceID); err != nil {
 		return err
 	}
 	rejectCase, err := h.openCase(rejectDeviceID)
@@ -375,6 +384,411 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkRecordIntermediateCheck() error {
+	h := newHarness()
+	defer h.close()
+
+	deviceID, err := h.createDevice("MET-1501")
+	if err != nil {
+		return err
+	}
+
+	// A validity deadline at or before the performance time is invalid and must
+	// be rejected before anything lands.
+	invalidWindow, err := h.request(http.MethodPost, "/devices/"+deviceID+"/checks", map[string]any{
+		"result":       "passed",
+		"standard":     "Reference Gauge RG-9",
+		"performed_by": "Mei",
+		"performed_at": time.Now().Add(-24 * time.Hour).Format(time.RFC3339),
+		"valid_until":  time.Now().Add(-48 * time.Hour).Format(time.RFC3339),
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(invalidWindow, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(invalidWindow, "invalid_input"); err != nil {
+		return err
+	}
+	history, err := h.request(http.MethodGet, "/devices/"+deviceID+"/checks", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(history, http.StatusOK); err != nil {
+		return err
+	}
+	checks, err := nestedSlice(history.Body, "checks")
+	if err != nil {
+		return err
+	}
+	if len(checks) != 0 {
+		return fmt.Errorf("rejected check left %d records on the device", len(checks))
+	}
+	currentID, present := history.Body["current_check_id"]
+	if present && currentID != "" {
+		return fmt.Errorf("rejected check was adopted on the device: %v", currentID)
+	}
+
+	// A structurally valid but already-expired check is kept on the ledger for
+	// traceability yet must never become the current check.
+	stale, err := h.request(http.MethodPost, "/devices/"+deviceID+"/checks", map[string]any{
+		"result":       "passed",
+		"standard":     "Reference Gauge RG-9",
+		"performed_by": "Mei",
+		"performed_at": time.Now().Add(-48 * time.Hour).Format(time.RFC3339),
+		"valid_until":  time.Now().Add(-time.Hour).Format(time.RFC3339),
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(stale, http.StatusCreated); err != nil {
+		return err
+	}
+	if value := stale.Body["current_check_id"]; value != nil && value != "" {
+		return fmt.Errorf("already-expired check was adopted: %v", value)
+	}
+	if valid, _ := stale.Body["current_check_valid"].(bool); valid {
+		return errors.New("already-expired check is reported valid")
+	}
+	staleChecks, err := nestedSlice(stale.Body, "checks")
+	if err != nil {
+		return err
+	}
+	if len(staleChecks) != 1 {
+		return fmt.Errorf("expired historical check missing from ledger: %d entries", len(staleChecks))
+	}
+	// The rejected registration before it must have rolled back completely: the
+	// first successfully committed check keeps the first allocated id.
+	staleCheckID, err := nestedPathString(stale.Body, "checks", 0, "id")
+	if err != nil {
+		return err
+	}
+	if staleCheckID != "check-0001" {
+		return fmt.Errorf("rejected registration was not fully rolled back, first id = %q", staleCheckID)
+	}
+
+	// A valid passing check becomes the single check in force.
+	passed := time.Now().Add(-time.Hour)
+	until := time.Now().Add(30 * 24 * time.Hour)
+	first, err := h.request(http.MethodPost, "/devices/"+deviceID+"/checks", map[string]any{
+		"result":       "passed",
+		"standard":     "Reference Gauge RG-9",
+		"performed_by": "Mei",
+		"performed_at": passed.Format(time.RFC3339),
+		"valid_until":  until.Format(time.RFC3339),
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(first, http.StatusCreated); err != nil {
+		return err
+	}
+	firstCheckID, err := nestedString(first.Body, "current_check_id")
+	if err != nil {
+		return err
+	}
+	if firstCheckID == "" {
+		return errors.New("passing check was not adopted as the current check")
+	}
+	if valid, _ := first.Body["current_check_valid"].(bool); !valid {
+		return errors.New("fresh passing check is not reported valid")
+	}
+	firstChecks, err := nestedSlice(first.Body, "checks")
+	if err != nil {
+		return err
+	}
+	if len(firstChecks) != 2 {
+		return fmt.Errorf("check history after valid pass = %d entries", len(firstChecks))
+	}
+
+	// A failed check is kept on the check ledger for traceability but must clear
+	// the device's current check so it no longer has one check in force.
+	failed, err := h.request(http.MethodPost, "/devices/"+deviceID+"/checks", map[string]any{
+		"result":       "failed",
+		"standard":     "Reference Gauge RG-9",
+		"performed_by": "Mei",
+		"performed_at": time.Now().Format(time.RFC3339),
+		"valid_until":  time.Now().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(failed, http.StatusCreated); err != nil {
+		return err
+	}
+	if value := failed.Body["current_check_id"]; value != nil && value != "" {
+		return fmt.Errorf("failed check became the current check: %v", value)
+	}
+	if valid, _ := failed.Body["current_check_valid"].(bool); valid {
+		return errors.New("device reports a valid current check after a failed check")
+	}
+	failedChecks, err := nestedSlice(failed.Body, "checks")
+	if err != nil {
+		return err
+	}
+	if len(failedChecks) != 3 {
+		return fmt.Errorf("failed check must stay on the ledger: %d entries", len(failedChecks))
+	}
+
+	// A later passing check replaces the failed one as the single current check.
+	second, err := h.request(http.MethodPost, "/devices/"+deviceID+"/checks", map[string]any{
+		"result":       "passed",
+		"standard":     "Reference Gauge RG-9",
+		"performed_by": "Mei",
+		"performed_at": time.Now().Format(time.RFC3339),
+		"valid_until":  time.Now().Add(14 * 24 * time.Hour).Format(time.RFC3339),
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(second, http.StatusCreated); err != nil {
+		return err
+	}
+	secondCheckID, err := nestedString(second.Body, "current_check_id")
+	if err != nil {
+		return err
+	}
+	if secondCheckID == "" || secondCheckID == firstCheckID {
+		return fmt.Errorf("later pass did not replace the current check: first=%q second=%q", firstCheckID, secondCheckID)
+	}
+	return nil
+}
+
+func checkMeasurementCheckGate() error {
+	h := newHarness()
+	defer h.close()
+
+	// A device with no check can open a case but cannot record a measurement.
+	deviceID, err := h.createDevice("MET-1502")
+	if err != nil {
+		return err
+	}
+	opened, err := h.openCase(deviceID)
+	if err != nil {
+		return err
+	}
+	caseID, err := nestedString(opened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	blocked, err := h.recordMeasurement(caseID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(blocked, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(blocked, "no_valid_check"); err != nil {
+		return err
+	}
+	if measurements, _ := nestedSlice(blocked.Body, "measurements"); len(measurements) != 0 {
+		return fmt.Errorf("blocked measurement left %d records", len(measurements))
+	}
+
+	// A failed check keeps the gate closed.
+	if err := h.recordCheck(deviceID, map[string]any{
+		"result":       "failed",
+		"standard":     "Reference Gauge RG-9",
+		"performed_by": "Mei",
+		"performed_at": time.Now().Format(time.RFC3339),
+		"valid_until":  time.Now().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+	}); err != nil {
+		return err
+	}
+	blockedAfterFail, err := h.recordMeasurement(caseID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(blockedAfterFail, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(blockedAfterFail, "no_valid_check"); err != nil {
+		return err
+	}
+
+	// A check that was passed but has already expired keeps the gate closed.
+	if err := h.recordCheck(deviceID, map[string]any{
+		"result":       "passed",
+		"standard":     "Reference Gauge RG-9",
+		"performed_by": "Mei",
+		"performed_at": time.Now().Add(-48 * time.Hour).Format(time.RFC3339),
+		"valid_until":  time.Now().Add(-time.Hour).Format(time.RFC3339),
+	}); err != nil {
+		return err
+	}
+	blockedAfterExpiry, err := h.recordMeasurement(caseID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(blockedAfterExpiry, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(blockedAfterExpiry, "no_valid_check"); err != nil {
+		return err
+	}
+
+	// A fresh passing check opens the gate and the measurement goes through.
+	if err := h.recordPassingCheck(deviceID); err != nil {
+		return err
+	}
+	allowed, err := h.recordMeasurement(caseID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	return expectStatus(allowed, http.StatusCreated)
+}
+
+func checkMeasurementCheckPinning() error {
+	h := newHarness()
+	defer h.close()
+
+	deviceID, err := h.createDevice("MET-1503")
+	if err != nil {
+		return err
+	}
+	if err := h.recordPassingCheck(deviceID); err != nil {
+		return err
+	}
+	checksView, err := h.request(http.MethodGet, "/devices/"+deviceID+"/checks", nil)
+	if err != nil {
+		return err
+	}
+	firstCheckID, err := nestedString(checksView.Body, "current_check_id")
+	if err != nil {
+		return err
+	}
+
+	opened, err := h.openCase(deviceID)
+	if err != nil {
+		return err
+	}
+	caseID, err := nestedString(opened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+
+	// An out-of-tolerance measurement under the first check stays pinned to it.
+	rejected, err := h.recordMeasurement(caseID, 26.5, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rejected, http.StatusCreated); err != nil {
+		return err
+	}
+	pinnedOnRejected, err := nestedPathString(rejected.Body, "measurements", 0, "check_id")
+	if err != nil {
+		return err
+	}
+	if pinnedOnRejected != firstCheckID {
+		return fmt.Errorf("rejected measurement pinned to %q, expected %q", pinnedOnRejected, firstCheckID)
+	}
+
+	// Reopen, register a replacement check, and measure again. The new
+	// measurement must point at the new check while history keeps the old one.
+	reopened, err := h.request(http.MethodPost, "/cases/"+caseID+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "setup corrected after failed measurement",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopened, http.StatusOK); err != nil {
+		return err
+	}
+	if err := h.recordPassingCheck(deviceID); err != nil {
+		return err
+	}
+	checksView, err = h.request(http.MethodGet, "/devices/"+deviceID+"/checks", nil)
+	if err != nil {
+		return err
+	}
+	secondCheckID, err := nestedString(checksView.Body, "current_check_id")
+	if err != nil {
+		return err
+	}
+	if secondCheckID == firstCheckID {
+		return errors.New("replacement check did not become current")
+	}
+
+	accepted, err := h.recordMeasurement(caseID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(accepted, http.StatusCreated); err != nil {
+		return err
+	}
+	acceptedMeasurements, err := nestedSlice(accepted.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(acceptedMeasurements) != 2 {
+		return fmt.Errorf("expected full measurement history, got %d", len(acceptedMeasurements))
+	}
+	firstPinned, err := nestedPathString(accepted.Body, "measurements", 0, "check_id")
+	if err != nil {
+		return err
+	}
+	secondPinned, err := nestedPathString(accepted.Body, "measurements", 1, "check_id")
+	if err != nil {
+		return err
+	}
+	if firstPinned != firstCheckID || secondPinned != secondCheckID {
+		return fmt.Errorf("pinning changed: historical=%q want %q, current=%q want %q", firstPinned, firstCheckID, secondPinned, secondCheckID)
+	}
+
+	// Seal: the frozen record binds the selected accepted measurement to the
+	// check it was actually performed under.
+	sealed, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Verifier Shen",
+		"summary":  "accepted measurement sealed with its intermediate check",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	sealCheckID, err := nestedString(sealed.Body, "seal", "measurement_check_id")
+	if err != nil {
+		return err
+	}
+	if sealCheckID != secondCheckID {
+		return fmt.Errorf("seal froze check %q, expected %q", sealCheckID, secondCheckID)
+	}
+
+	// A later replacement check must not rewrite any pinned measurement or seal.
+	if err := h.recordPassingCheck(deviceID); err != nil {
+		return err
+	}
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(read, http.StatusOK); err != nil {
+		return err
+	}
+	historicalFirst, err := nestedPathString(read.Body, "measurements", 0, "check_id")
+	if err != nil {
+		return err
+	}
+	historicalSecond, err := nestedPathString(read.Body, "measurements", 1, "check_id")
+	if err != nil {
+		return err
+	}
+	if historicalFirst != firstCheckID || historicalSecond != secondCheckID {
+		return fmt.Errorf("sealed measurement history was rewritten: %q/%q", historicalFirst, historicalSecond)
+	}
+	sealedCheckID, err := nestedString(read.Body, "seal", "measurement_check_id")
+	if err != nil {
+		return err
+	}
+	if sealedCheckID != secondCheckID {
+		return fmt.Errorf("sealed record was rewritten to %q", sealedCheckID)
+	}
+	return nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -463,9 +877,30 @@ func (h *harness) recordMeasurement(caseID string, observed float64, technician 
 	})
 }
 
+func (h *harness) recordPassingCheck(deviceID string) error {
+	return h.recordCheck(deviceID, map[string]any{
+		"result":       "passed",
+		"standard":     "Reference Gauge RG-9",
+		"performed_by": "Mei",
+		"performed_at": time.Now().Add(-time.Hour).Format(time.RFC3339),
+		"valid_until":  time.Now().Add(30 * 24 * time.Hour).Format(time.RFC3339),
+	})
+}
+
+func (h *harness) recordCheck(deviceID string, body map[string]any) error {
+	response, err := h.request(http.MethodPost, "/devices/"+deviceID+"/checks", body)
+	if err != nil {
+		return err
+	}
+	return expectStatus(response, http.StatusCreated)
+}
+
 func (h *harness) rejectedCase(tag string) (string, error) {
 	deviceID, err := h.createDevice(tag)
 	if err != nil {
+		return "", err
+	}
+	if err := h.recordPassingCheck(deviceID); err != nil {
 		return "", err
 	}
 	opened, err := h.openCase(deviceID)
@@ -489,6 +924,9 @@ func (h *harness) rejectedCase(tag string) (string, error) {
 func (h *harness) readyCase(tag string) (string, error) {
 	deviceID, err := h.createDevice(tag)
 	if err != nil {
+		return "", err
+	}
+	if err := h.recordPassingCheck(deviceID); err != nil {
 		return "", err
 	}
 	opened, err := h.openCase(deviceID)
@@ -535,6 +973,18 @@ func nestedString(root map[string]any, path ...string) (string, error) {
 	text, ok := value.(string)
 	if !ok {
 		return "", fmt.Errorf("%s is not a string", strings.Join(path, "."))
+	}
+	return text, nil
+}
+
+func nestedPathString(root map[string]any, path ...any) (string, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return "", err
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%v is not a string", path)
 	}
 	return text, nil
 }

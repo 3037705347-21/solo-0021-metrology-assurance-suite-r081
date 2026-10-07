@@ -59,11 +59,22 @@ func (s Snapshot) Case(id string) (domain.VerificationCase, bool) {
 }
 
 func (s Snapshot) Measurements(caseID string) []domain.Measurement {
-	return append([]domain.Measurement(nil), s.measurements[caseID]...)
+	return append([]domain.Measurement{}, s.measurements[caseID]...)
 }
 
 func (s Snapshot) Checks(deviceID string) []domain.IntermediateCheck {
-	return append([]domain.IntermediateCheck(nil), s.checks[deviceID]...)
+	return append([]domain.IntermediateCheck{}, s.checks[deviceID]...)
+}
+
+func (s Snapshot) Check(checkID string) (domain.IntermediateCheck, bool) {
+	for _, items := range s.checks {
+		for _, item := range items {
+			if item.ID == checkID {
+				return item, true
+			}
+		}
+	}
+	return domain.IntermediateCheck{}, false
 }
 
 func (s Snapshot) Seal(caseID string) (domain.EvidenceSeal, bool) {
@@ -72,7 +83,7 @@ func (s Snapshot) Seal(caseID string) (domain.EvidenceSeal, bool) {
 }
 
 func (s Snapshot) Events(caseID string) []domain.AuditEvent {
-	var result []domain.AuditEvent
+	result := []domain.AuditEvent{}
 	for _, item := range s.events {
 		if item.CaseID == caseID {
 			result = append(result, item)
@@ -181,16 +192,30 @@ func (m *Mutation) AppendMeasurement(item domain.Measurement) error {
 }
 
 func (m *Mutation) Measurements(caseID string) []domain.Measurement {
-	return append([]domain.Measurement(nil), m.measurements[caseID]...)
+	return append([]domain.Measurement{}, m.measurements[caseID]...)
 }
 
 func (m *Mutation) Checks(deviceID string) []domain.IntermediateCheck {
-	return append([]domain.IntermediateCheck(nil), m.checks[deviceID]...)
+	return append([]domain.IntermediateCheck{}, m.checks[deviceID]...)
+}
+
+func (m *Mutation) Check(checkID string) (domain.IntermediateCheck, bool) {
+	for _, items := range m.checks {
+		for _, item := range items {
+			if item.ID == checkID {
+				return item, true
+			}
+		}
+	}
+	return domain.IntermediateCheck{}, false
 }
 
 func (m *Mutation) AppendCheck(item domain.IntermediateCheck) error {
 	if _, exists := m.devices[item.DeviceID]; !exists {
 		return fmt.Errorf("%w: device %s", domain.ErrNotFound, item.DeviceID)
+	}
+	if _, exists := m.Check(item.ID); exists {
+		return fmt.Errorf("%w: check %s already recorded", domain.ErrStateConflict, item.ID)
 	}
 	m.checks[item.DeviceID] = append(m.checks[item.DeviceID], item)
 	return nil
@@ -214,7 +239,7 @@ func (m *Mutation) AppendEvent(item domain.AuditEvent) {
 }
 
 func (m *Mutation) Events(caseID string) []domain.AuditEvent {
-	var result []domain.AuditEvent
+	result := []domain.AuditEvent{}
 	for _, item := range m.events {
 		if item.CaseID == caseID {
 			result = append(result, item)

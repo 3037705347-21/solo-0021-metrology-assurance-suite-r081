@@ -30,6 +30,18 @@
     {
       "workflow_id": "seal-verification",
       "command": "go run ./cmd/workflowcheck --workflow seal-verification"
+    },
+    {
+      "workflow_id": "record-intermediate-check",
+      "command": "go run ./cmd/workflowcheck --workflow record-intermediate-check"
+    },
+    {
+      "workflow_id": "measurement-check-gate",
+      "command": "go run ./cmd/workflowcheck --workflow measurement-check-gate"
+    },
+    {
+      "workflow_id": "measurement-check-pinning",
+      "command": "go run ./cmd/workflowcheck --workflow measurement-check-pinning"
     }
   ]
 }

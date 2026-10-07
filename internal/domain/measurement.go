@@ -42,6 +42,9 @@ func (m Measurement) Validate() error {
 	if m.ID == "" || m.CaseID == "" || m.Technician == "" {
 		return fmt.Errorf("%w: measurement id, case id, and technician are required", ErrInvalidInput)
 	}
+	if m.CheckID == "" {
+		return fmt.Errorf("%w: measurement must reference the intermediate check it was performed under", ErrInvalidInput)
+	}
 	if !isFinite(m.Observed) || !isFinite(m.Nominal) || !isFinite(m.Tolerance) || m.Tolerance <= 0 {
 		return fmt.Errorf("%w: observed and nominal must be finite and tolerance must be positive", ErrInvalidInput)
 	}
