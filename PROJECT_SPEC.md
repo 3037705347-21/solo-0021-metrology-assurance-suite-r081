@@ -26,6 +26,9 @@ external service.
   value, tolerance, current state, version, and assigned steward.
 - Measurement: an observed value, computed deviation, acceptance decision,
   technician, and timestamp.
+- IntermediateCheck: a bounded interim check for one device between formal
+  calibrations, with a result, standard, performer, performance time, and
+  validity deadline.
 - EvidenceSeal: the immutable closing record for a reviewed case, including the
   selected accepted measurement.
 - AuditEvent: an append-only trace of meaningful case and device changes.
@@ -47,10 +50,12 @@ unfinished case. A valid request creates a case in `awaiting_measurement`.
 ### 3. Record Measurement
 
 A technician sends `POST /cases/{id}/measurements`. The case must be
-`awaiting_measurement`. The service computes the signed deviation from the
-nominal value. An in-tolerance measurement moves the case to
-`review_ready`; an out-of-tolerance measurement moves it to
-`recheck_required`.
+`awaiting_measurement`. If the device has a current intermediate check, the
+check must be passed and unexpired; a failed or expired check rejects the
+measurement. The measurement permanently records the current check it is based
+on. The service computes the signed deviation from the nominal value. An
+in-tolerance measurement moves the case to `review_ready`; an out-of-tolerance
+measurement moves it to `recheck_required`.
 
 ### 4. Reopen Verification Case
 
@@ -64,6 +69,15 @@ The verifier sends `POST /cases/{id}/seal` after an accepted measurement. Only
 `review_ready` cases may be sealed. The service selects the accepted
 measurement with the smallest absolute deviation, creates exactly one evidence
 seal, moves the case to `sealed`, and rejects later mutations.
+
+### 6. Record Intermediate Check
+
+The steward sends `POST /devices/{id}/checks` with the check result, standard,
+performer, performance time, and validity deadline. The validity deadline must
+be after the performance time; an invalid registration is rejected atomically
+and leaves no trace on the device, the check history, or any measurement or
+seal. A registered check becomes the device's single current check, replacing
+any previous one, and the device records the check's actual result.
 
 ## State And Rules
 
@@ -88,6 +102,14 @@ Required invariants:
 - A tolerance must be positive.
 - A case can have at most one evidence seal.
 - A sealed case cannot accept measurements, reopen, or seal again.
+- A device has at most one current intermediate check; a newly registered
+  check replaces it.
+- A device whose current check failed or is expired cannot record new
+  measurements.
+- A rejected check registration leaves no trace on the device, measurements,
+  or seals.
+- A measurement permanently records the check it was based on; later checks
+  never rewrite recorded or sealed measurements.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
 
@@ -107,6 +129,8 @@ Required invariants:
 - `GET /healthz`
 - `POST /devices`
 - `GET /devices/{id}`
+- `POST /devices/{id}/checks`
+- `GET /devices/{id}/checks`
 - `POST /cases`
 - `GET /cases/{id}`
 - `POST /cases/{id}/measurements`

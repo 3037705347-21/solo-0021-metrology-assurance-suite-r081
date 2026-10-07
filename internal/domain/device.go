@@ -72,6 +72,9 @@ func (c IntermediateCheck) Validate() error {
 	if c.PerformedAt.IsZero() || c.ValidUntil.IsZero() {
 		return fmt.Errorf("%w: check performance and validity times are required", ErrInvalidInput)
 	}
+	if !c.ValidUntil.After(c.PerformedAt) {
+		return fmt.Errorf("%w: check validity window is invalid", ErrInvalidInput)
+	}
 	return nil
 }
 
@@ -129,10 +132,13 @@ func (d *Device) Retire(at time.Time) error {
 
 func (d *Device) AdoptCheck(id string, result CheckResult, validUntil time.Time) {
 	d.CurrentCheckID = strings.TrimSpace(id)
-	d.CurrentCheckResult = CheckPassed
+	d.CurrentCheckResult = result
 	d.CurrentCheckUntil = validUntil.UTC()
 }
 
-func (d Device) HasCurrentCheck() bool {
-	return d.CurrentCheckID != "" && d.CurrentCheckResult == CheckPassed
+func (d Device) HasValidCurrentCheck(at time.Time) bool {
+	if d.CurrentCheckID == "" || d.CurrentCheckResult != CheckPassed || d.CurrentCheckUntil.IsZero() {
+		return false
+	}
+	return !at.UTC().After(d.CurrentCheckUntil)
 }

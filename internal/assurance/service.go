@@ -150,7 +150,7 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if !exists {
 			return fmt.Errorf("%w: device %s", domain.ErrNotFound, item.DeviceID)
 		}
-		if device.CurrentCheckID != "" && !device.HasCurrentCheck() {
+		if device.CurrentCheckID != "" && !device.HasValidCurrentCheck(s.now()) {
 			return fmt.Errorf("%w: device %s has no valid intermediate check", domain.ErrStateConflict, device.ID)
 		}
 		measurement, err := domain.NewMeasurement(
@@ -241,10 +241,7 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 }
 
 func (s *Service) RecordCheck(ctx context.Context, deviceID string, input contracts.RecordCheckRequest) (contracts.ChecksResponse, error) {
-	var (
-		result  contracts.ChecksResponse
-		created domain.IntermediateCheck
-	)
+	var result contracts.ChecksResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		id := strings.TrimSpace(deviceID)
 		device, exists := m.Device(id)
@@ -284,15 +281,11 @@ func (s *Service) RecordCheck(ctx context.Context, deviceID string, input contra
 			return err
 		}
 		m.AppendEvent(event)
-		created = item
 		result = checksResponse(m, device)
 		return nil
 	})
 	if err != nil {
 		return contracts.ChecksResponse{}, err
-	}
-	if !created.ValidUntil.After(created.PerformedAt) {
-		return contracts.ChecksResponse{}, fmt.Errorf("%w: check validity window is invalid", domain.ErrInvalidInput)
 	}
 	return result, nil
 }
@@ -391,9 +384,6 @@ func caseResponse(m *repository.Mutation, item domain.VerificationCase) contract
 	if seal, exists := m.Seal(item.ID); exists {
 		result.Seal = &seal
 	}
-	if device, exists := m.Device(item.DeviceID); exists {
-		result.Measurements = bindMeasurementsToCurrentCheck(result.Measurements, device.CurrentCheckID)
-	}
 	return result
 }
 
@@ -406,17 +396,7 @@ func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.Verifica
 	if seal, exists := snapshot.Seal(item.ID); exists {
 		result.Seal = &seal
 	}
-	if device, exists := snapshot.Device(item.DeviceID); exists {
-		result.Measurements = bindMeasurementsToCurrentCheck(result.Measurements, device.CurrentCheckID)
-	}
 	return result
-}
-
-func bindMeasurementsToCurrentCheck(items []domain.Measurement, checkID string) []domain.Measurement {
-	for index := range items {
-		items[index].CheckID = checkID
-	}
-	return items
 }
 
 func checksResponse(m *repository.Mutation, device domain.Device) contracts.ChecksResponse {
